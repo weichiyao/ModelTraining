@@ -1,16 +1,14 @@
 from __future__ import annotations
 
+from lightning.pytorch import LightningModule
 import numpy as np
-
 import torch
 from torch import nn
-from torch.optim import AdamW, lr_scheduler, Optimizer
-
-from lightning.pytorch import LightningModule
+from torch.optim import AdamW, Optimizer, lr_scheduler
 
 from transformers import (
-    get_cosine_schedule_with_warmup,
     get_constant_schedule_with_warmup,
+    get_cosine_schedule_with_warmup,
     get_linear_schedule_with_warmup,
     get_polynomial_decay_schedule_with_warmup
 )
@@ -268,6 +266,7 @@ class TrainPLModule(LightningModule):
             if num_warmup_steps > 0 :
                 # Retain the original first-update LR of base_lr / warmup_steps.
                 def warmup_lambda(step):
+                    # linearly ramps 0 → 1 over num_warmup_steps
                     return min((step + 1) / float(num_warmup_steps), 1.0)
                 scheds.append(lr_scheduler.LambdaLR(optimizer, lr_lambda=warmup_lambda))
                 milestones.append(num_warmup_steps)
