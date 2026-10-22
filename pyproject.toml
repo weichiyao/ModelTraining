@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ModelTraining"
+version = "0.0.1"
+description = "Reusable model training schedules and PyTorch Lightning helpers"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+  "numpy",
+  "lightning>=2.6,<3",
+  "torch>=2.2",
+  "transformers>=4.20,<6",
+  "wandb>=0.19.10",
+]
+
+[project.optional-dependencies]
+dev = ["build", "pytest"]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["model_training*"]
+namespaces = false
