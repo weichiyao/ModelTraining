@@ -1,24 +1,11 @@
-"""Copyright (c) Meta Platforms, Inc. and affiliates."""
-
-# From:
+# Adapted from:
 # https://github.com/NVIDIA/NeMo/blob/main/nemo/collections/common/callbacks/ema.py
 # https://github.com/facebookresearch/all-atom-diffusion-transformer/blob/main/src/callbacks/ema.py
 #
 # Copyright (c) 2022, NVIDIA CORPORATION.  All rights reserved.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
+# Copyright (c) Meta Platforms, Inc. and affiliates. 
 
-from __future__ import annotations
+from __future__ import annotations  # noqa: I001
 import contextlib
 import copy
 import os
@@ -95,6 +82,15 @@ class EMA(Callback):
     def on_test_end(self, trainer: pl.Trainer, pl_module: pl.LightningModule) -> None:
         if self._should_validate_ema_weights(trainer):
             self.swap_model_weights(trainer)
+
+    def on_exception(
+        self, trainer: pl.Trainer, pl_module: pl.LightningModule, exception: BaseException
+    ) -> None:
+        # Checkpoint callbacks run after EMA. Recover the live parameters before
+        # an exception checkpoint pairs them with their optimizer moments.
+        for optimizer in trainer.optimizers:
+            if isinstance(optimizer, EMAOptimizer) and optimizer.main_weights_are_ema:
+                optimizer.switch_main_parameter_weights()
 
     def _should_validate_ema_weights(self, trainer: pl.Trainer) -> bool:
         return not self.validate_original_weights and self._ema_initialized(trainer)

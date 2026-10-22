@@ -1,25 +1,54 @@
+import warnings
 from argparse import Namespace
 
-from lightning.pytorch import loggers
 from lightning.pytorch.callbacks import Callback, ModelCheckpoint
+from lightning.pytorch.loggers import Logger
 
 from .callbacks import EMA, EMAModelCheckpoint
+from .callbacks.validation import OptimizerStepValidation
+
+
+class _EpochLastCheckpoint(ModelCheckpoint):
+    """Keep the final full state even when training ends between epoch saves."""
+
+    @property
+    def state_key(self):
+        # Preserve the callback identity used by existing resume checkpoints.
+        return super().state_key.replace(
+            type(self).__qualname__, ModelCheckpoint.__qualname__, 1
+        )
+
+    def on_train_end(self, trainer, pl_module):
+        super().on_train_end(trainer, pl_module)
+        if not self._should_skip_saving_checkpoint(trainer):
+            self._save_topk_checkpoint(trainer, self._monitor_candidates(trainer))
 
 
 def get_trainer_inputs(
     log_dir: str,
     args: Namespace,
-    logger: loggers,
-    monitor: list | None = None,
-    mode: list | None = None,
-    filename: list | None = None,
+    logger: Logger | list[Logger] | bool | None,
+    monitor: str | list[str] | None = None,
+    mode: str | list[str] | None = None,
+    filename: str | list[str] | None = None,
 ):
+    """Build Trainer options and callbacks for epoch- or step-limited training."""
+    max_steps = getattr(args, "max_steps", -1)
+    if max_steps > 0 and args.max_epochs > 0:
+        warnings.warn(
+            "Both max_steps and max_epochs are positive; max_epochs takes "
+            "precedence. Overriding max_steps=-1 for the Trainer.",
+            UserWarning,
+            stacklevel=2,
+        )
+        max_steps = -1
+
     if monitor is None:
-        monitor = ['val_loss']
+        monitor = ["val_loss"]
     if mode is None:
-        mode = ['min']
+        mode = ["min"]
     if filename is None:
-        filename = ['best-epoch{epoch}-step{step}-val_loss{val_loss:.4f}']
+        filename = ["best-epoch{epoch}-step{step}-val_loss{val_loss:.4f}"]
     if isinstance(monitor, str):
         monitor = [monitor]
     if isinstance(mode, str):
@@ -27,49 +56,37 @@ def get_trainer_inputs(
     if isinstance(filename, str):
         filename = [filename]
 
-    step_limited_training = hasattr(args, "max_steps") and args.max_steps > 0 and args.max_epochs < 0
-
-    save_on_train_epoch_end = True
-    every_n_epochs          = max(1, args.log_interval)  # checkpoint/validate every N epochs
-    check_val_every_n_epoch = max(1, args.log_interval)
-    val_check_interval      = None
-
-    last_every_n_epochs = every_n_epochs
-    last_every_n_train_steps = None
-    last_save_on_train_epoch_end = save_on_train_epoch_end
-    monitor_every_n_epochs = every_n_epochs
-    monitor_every_n_train_steps = None
-    monitor_save_on_train_epoch_end = False
-
-    if step_limited_training:
-        last_every_n_epochs = None
-        last_save_on_train_epoch_end = False
-        last_every_n_train_steps = max(500, int(args.log_every_n_steps))
-
-
-    # ---- callbacks (fast & predictable) ----
-    callbacks: list[Callback] = []
-
-    MonitorCheckpointCls = ModelCheckpoint
-    if hasattr(args, "ema") and args.ema: 
-        callbacks = [
-            EMA(decay=0.9999, validate_original_weights=False, every_n_steps=1, cpu_offload=False),
-        ]
-        MonitorCheckpointCls = EMAModelCheckpoint
-
+    step_limited_training = max_steps > 0 and args.max_epochs < 0
+    epoch_interval = max(1, args.log_interval)
     step_val_interval = getattr(args, "step_val_interval", -1)
-    if step_limited_training and step_val_interval > 0:
-        from .callbacks.validation import OptimizerStepValidation
+    step_validation = step_limited_training and step_val_interval > 0
+    last_cadence = (
+        {"every_n_train_steps": max(500, int(args.log_every_n_steps))}
+        if step_limited_training
+        else {"every_n_epochs": epoch_interval}
+    )
 
+    callbacks: list[Callback] = []
+    monitor_checkpoint_cls = ModelCheckpoint
+    if getattr(args, "ema", False):
+        callbacks.append(
+            EMA(
+                decay=0.9999,
+                validate_original_weights=False,
+                every_n_steps=1,
+                cpu_offload=False,
+            ),
+        )
+        monitor_checkpoint_cls = EMAModelCheckpoint
+
+    if step_validation:
         callbacks.append(OptimizerStepValidation(step_val_interval))
-        check_val_every_n_epoch = None
-        val_check_interval = 1
-        # Each completed validation supplies fresh metrics, regardless of epoch.
-        monitor_every_n_epochs = 1
 
-
+    last_checkpoint_cls = (
+        ModelCheckpoint if step_limited_training else _EpochLastCheckpoint
+    )
     callbacks.append(
-        ModelCheckpoint(
+        last_checkpoint_cls(
             filename="last",
             save_last=False,
             save_top_k=1,
@@ -79,19 +96,13 @@ def get_trainer_inputs(
             save_on_exception=True,
             auto_insert_metric_name=False,
             enable_version_counter=False,
-            every_n_epochs=last_every_n_epochs,
-            every_n_train_steps=last_every_n_train_steps,
-            save_on_train_epoch_end=last_save_on_train_epoch_end,
+            save_on_train_epoch_end=not step_limited_training,
+            **last_cadence,
         )
     )
-    n_monitor = len(monitor)
-    for j in range(n_monitor):
+    for j in range(len(monitor)):
         callbacks.append(
-            # Use the EMA-aware subclass when EMA is enabled so monitored
-            # checkpoints contain the EMA weights (which are what produced
-            # the val metric being monitored).  Falls back to plain
-            # ModelCheckpoint when EMA is off.
-            MonitorCheckpointCls(
+            monitor_checkpoint_cls(
                 monitor=monitor[j],
                 dirpath=log_dir,
                 save_last=False,
@@ -100,31 +111,29 @@ def get_trainer_inputs(
                 mode=mode[j],
                 filename=filename[j],
                 auto_insert_metric_name=False,
-                every_n_epochs=monitor_every_n_epochs,
-                every_n_train_steps=monitor_every_n_train_steps,
-                # Validation metrics are not available until the validation loop finishes,
-                # so save monitored checkpoints after validation, not at train epoch end.
-                save_on_train_epoch_end=monitor_save_on_train_epoch_end,
+                every_n_epochs=1 if step_validation else epoch_interval,
+                # Save the weights that produced the fresh validation metric.
+                save_on_train_epoch_end=False,
             )
         )
 
     kwargs_trainer = {
-        "num_sanity_val_steps": 0,  # Disable the sanity check
+        "num_sanity_val_steps": 0,
         "max_epochs": args.max_epochs,
         "min_epochs": max(0, args.min_epochs),
-        "max_steps": getattr(args, "max_steps", -1),
+        "max_steps": max_steps,
         "enable_model_summary": True,
         "enable_progress_bar": args.progress_bar,
-        "check_val_every_n_epoch": check_val_every_n_epoch,  # epoch-based validation cadence; validate every n epoch
-        "val_check_interval": val_check_interval,  # within-epoch validation cadence
+        "check_val_every_n_epoch": None if step_validation else epoch_interval,
+        "val_check_interval": 1 if step_validation else None,
         "default_root_dir": log_dir,
         "enable_checkpointing": True,
         "logger": logger,
         "deterministic": True,
         "accelerator": args.device,
         "strategy": "ddp_find_unused_parameters_true" if args.use_ddp else "auto",
-        "devices": args.n_devices,  # Number of GPUs per node to use
-        "num_nodes": args.num_nodes,  # Number of nodes for distributed training
+        "devices": args.n_devices,
+        "num_nodes": args.num_nodes,
         "gradient_clip_val": args.gradient_clip_val,
         "gradient_clip_algorithm": args.gradient_clip_algorithm,
         "accumulate_grad_batches": args.accumulate_grad_batches,
