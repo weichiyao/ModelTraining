@@ -19,7 +19,6 @@
 # limitations under the License.
 
 from __future__ import annotations
-
 import contextlib
 import copy
 import os
@@ -34,12 +33,19 @@ from lightning.pytorch.utilities.exceptions import MisconfigurationException
 from lightning.pytorch.utilities.rank_zero import rank_zero_info
 
 
+def _validate_settings(decay, every_n_steps):
+    if not 0 <= decay <= 1:
+        raise MisconfigurationException("EMA decay value must be between 0 and 1")
+    if not isinstance(every_n_steps, int) or every_n_steps < 1:
+        raise MisconfigurationException("EMA every_n_steps must be a positive integer")
+
+
 class EMA(Callback):
     """Implements Exponential Moving Averaging (EMA).
 
     When training a model, this callback will maintain moving averages of the trained parameters.
     When evaluating, we use the moving averages copy of the trained parameters.
-    When saving, we save an additional set of parameters with the prefix `ema`.
+    Full checkpoints retain the averages in the wrapped optimizer's state.
 
     Args:
         decay: The exponential decay used when calculating the moving average. Has to be between 0-1.
@@ -55,8 +61,7 @@ class EMA(Callback):
         every_n_steps: int = 1,
         cpu_offload: bool = False,
     ):
-        if not (0 <= decay <= 1):
-            raise MisconfigurationException("EMA decay value must be between 0 and 1")
+        _validate_settings(decay, every_n_steps)
         self.decay = decay
         self.validate_original_weights = validate_original_weights
         self.every_n_steps = every_n_steps
@@ -65,7 +70,7 @@ class EMA(Callback):
     def on_fit_start(self, trainer: pl.Trainer, pl_module: pl.LightningModule) -> None:
         device = pl_module.device if not self.cpu_offload else torch.device("cpu")
         trainer.optimizers = [
-            EMAOptimizer(
+            optim if isinstance(optim, EMAOptimizer) else EMAOptimizer(
                 optim,
                 device=device,
                 decay=self.decay,
@@ -73,18 +78,13 @@ class EMA(Callback):
                 current_step=trainer.global_step,
             )
             for optim in trainer.optimizers
-            if not isinstance(optim, EMAOptimizer)
         ]
 
-    def on_validation_start(
-        self, trainer: pl.Trainer, pl_module: pl.LightningModule
-    ) -> None:
+    def on_validation_start(self, trainer: pl.Trainer, pl_module: pl.LightningModule) -> None:
         if self._should_validate_ema_weights(trainer):
             self.swap_model_weights(trainer)
 
-    def on_validation_end(
-        self, trainer: pl.Trainer, pl_module: pl.LightningModule
-    ) -> None:
+    def on_validation_end(self, trainer: pl.Trainer, pl_module: pl.LightningModule) -> None:
         if self._should_validate_ema_weights(trainer):
             self.swap_model_weights(trainer)
 
@@ -100,9 +100,7 @@ class EMA(Callback):
         return not self.validate_original_weights and self._ema_initialized(trainer)
 
     def _ema_initialized(self, trainer: pl.Trainer) -> bool:
-        return any(
-            isinstance(optimizer, EMAOptimizer) for optimizer in trainer.optimizers
-        )
+        return any(isinstance(optimizer, EMAOptimizer) for optimizer in trainer.optimizers)
 
     def swap_model_weights(self, trainer: pl.Trainer, saving_ema_model: bool = False):
         for optimizer in trainer.optimizers:
@@ -111,12 +109,22 @@ class EMA(Callback):
 
     @contextlib.contextmanager
     def save_ema_model(self, trainer: pl.Trainer):
-        """Saves an EMA copy of the model + EMA optimizer states for resume."""
-        self.swap_model_weights(trainer, saving_ema_model=True)
+        """Expose EMA weights for inference saves, including during validation."""
+        optimizers = trainer.optimizers
+        swapped = []
+        previous_context = [optimizer.in_saving_ema_model_context for optimizer in optimizers]
         try:
+            for optimizer in optimizers:
+                if not optimizer.main_weights_are_ema:
+                    optimizer.switch_main_parameter_weights()
+                    swapped.append(optimizer)
+                optimizer.in_saving_ema_model_context = True
             yield
         finally:
-            self.swap_model_weights(trainer, saving_ema_model=False)
+            for optimizer in reversed(swapped):
+                optimizer.switch_main_parameter_weights()
+            for optimizer, flag in zip(optimizers, previous_context):
+                optimizer.in_saving_ema_model_context = flag
 
     @contextlib.contextmanager
     def save_original_optimizer_state(self, trainer: pl.Trainer):
@@ -130,13 +138,13 @@ class EMA(Callback):
                 optimizer.save_original_optimizer_state = False
 
     def on_load_checkpoint(
-        self,
-        trainer: pl.Trainer,
-        pl_module: pl.LightningModule,
-        checkpoint: dict[str, Any],
+        self, trainer: pl.Trainer, pl_module: pl.LightningModule, checkpoint: dict[str, Any]
     ) -> None:
         checkpoint_callback = trainer.checkpoint_callback
 
+        # use the connector as NeMo calls the connector directly in the exp_manager when restoring.
+        # connector = trainer._checkpoint_connector
+        # Replace connector._ckpt_path with below to avoid calling into lightning's protected API
         ckpt_path = trainer.ckpt_path
 
         if (
@@ -176,9 +184,7 @@ def ema_update(ema_model_tuple, current_model_tuple, decay):
     )
 
 
-def run_ema_update_cpu(
-    ema_model_tuple, current_model_tuple, decay, pre_sync_stream=None
-):
+def run_ema_update_cpu(ema_model_tuple, current_model_tuple, decay, pre_sync_stream=None):
     if pre_sync_stream is not None:
         pre_sync_stream.synchronize()
 
@@ -233,6 +239,7 @@ class EMAOptimizer(torch.optim.Optimizer):
         every_n_steps: int = 1,
         current_step: int = 0,
     ):
+        _validate_settings(decay, every_n_steps)
         self.optimizer = optimizer
         self.decay = decay
         self.device = device
@@ -247,16 +254,18 @@ class EMAOptimizer(torch.optim.Optimizer):
 
         self.ema_params = ()
         self.in_saving_ema_model_context = False
+        self.main_weights_are_ema = False
 
     def all_parameters(self) -> tuple[torch.Tensor]:
         return (param for group in self.param_groups for param in group["params"])
 
-    def step(self, closure=None, grad_scaler=None, **kwargs):
+    def step(self, closure=None, **kwargs):
         self.join()
 
         if self.first_iteration:
-            if any(p.is_cuda for p in self.all_parameters()):
-                self.stream = torch.cuda.Stream()
+            cuda_parameter = next((p for p in self.all_parameters() if p.is_cuda), None)
+            if cuda_parameter is not None:
+                self.stream = torch.cuda.Stream(device=cuda_parameter.device)
 
             self.first_iteration = False
 
@@ -269,13 +278,25 @@ class EMAOptimizer(torch.optim.Optimizer):
             )
             self.rebuild_ema_params = False
 
-        if (
-            getattr(self.optimizer, "_step_supports_amp_scaling", False)
-            and grad_scaler is not None
-        ):
-            loss = self.optimizer.step(closure=closure, grad_scaler=grad_scaler)
-        else:
-            loss = self.optimizer.step(closure)
+        # GradScaler attaches these to the wrapper for fused Adam/AdamW.
+        # Forward them to the optimizer that actually performs the update.
+        amp_fields = {name: self.__dict__[name] for name in ("grad_scale", "found_inf")
+                      if name in self.__dict__}
+        missing = object()
+        previous = {name: getattr(self.optimizer, name, missing) for name in amp_fields}
+        try:
+            for name, value in amp_fields.items():
+                setattr(self.optimizer, name, value)
+            loss = self.optimizer.step(closure=closure, **kwargs)
+        finally:
+            for name, value in previous.items():
+                if value is missing:
+                    delattr(self.optimizer, name)
+                else:
+                    setattr(self.optimizer, name, value)
+
+        if amp_fields.get("found_inf") is not None and amp_fields["found_inf"].item() != 0:
+            return loss
 
         if self._should_update_at_step():
             warmup_decay = min(
@@ -290,10 +311,10 @@ class EMAOptimizer(torch.optim.Optimizer):
         return self.current_step % self.every_n_steps == 0
 
     @torch.no_grad()
-    def update(self, decay_override: float | None = None):
+    def update(self, decay_override: float| None = None):
         decay = self.decay if decay_override is None else decay_override
         if self.stream is not None:
-            self.stream.wait_stream(torch.cuda.current_stream())
+            self.stream.wait_stream(torch.cuda.current_stream(self.stream.device))
 
         stream_context = (
             torch.cuda.stream(self.stream)
@@ -302,11 +323,10 @@ class EMAOptimizer(torch.optim.Optimizer):
         )
         with stream_context:
             current_model_state = tuple(
-                param.data.to(self.device, non_blocking=True)
-                for param in self.all_parameters()
+                param.data.to(self.device, non_blocking=True) for param in self.all_parameters()
             )
 
-            if self.device.type == "cuda":
+            if self.device.type != "cpu":
                 ema_update(self.ema_params, current_model_state, decay)
 
         if self.device.type == "cpu":
@@ -332,6 +352,8 @@ class EMAOptimizer(torch.optim.Optimizer):
         self.in_saving_ema_model_context = saving_ema_model
         for param, ema_param in zip(self.all_parameters(), self.ema_params):
             self.swap_tensors(param.data, ema_param)
+        if self.ema_params:
+            self.main_weights_are_ema = not self.main_weights_are_ema
 
     @contextlib.contextmanager
     def swap_ema_weights(self, enabled: bool = True):
@@ -383,6 +405,7 @@ class EMAOptimizer(torch.optim.Optimizer):
 
     def load_state_dict(self, state_dict):
         self.join()
+        _validate_settings(state_dict["decay"], state_dict["every_n_steps"])
 
         self.optimizer.load_state_dict(state_dict["opt"])
         self.ema_params = tuple(
@@ -392,6 +415,7 @@ class EMAOptimizer(torch.optim.Optimizer):
         self.decay = state_dict["decay"]
         self.every_n_steps = state_dict["every_n_steps"]
         self.rebuild_ema_params = False
+        self.main_weights_are_ema = False
 
     def add_param_group(self, param_group):
         self.optimizer.add_param_group(param_group)
@@ -407,39 +431,17 @@ def _find_ema_callback(trainer: pl.Trainer) -> EMA | None:
 
 
 class EMAModelCheckpoint(ModelCheckpoint):
-    """ModelCheckpoint that saves the EMA weights when an EMA callback is active.
+    """Save EMA inference weights, or live weights for a full resume checkpoint.
 
-    Plain ``ModelCheckpoint.save_checkpoint`` serializes ``pl_module.state_dict()``,
-    which contains the **live training weights** — the EMA copy lives inside the
-    wrapped optimizer's state and is only ever loaded into the module during
-    validation.  As a result, "best monitored checkpoint" files contain the
-    *live* model at the moment the monitored metric was best, NOT the EMA model
-    that actually produced that metric (since validation is run with EMA
-    weights when ``validate_original_weights=False``).
-
-    This subclass temporarily swaps the live and EMA weights for the duration
-    of the save, so the resulting checkpoint contains the EMA weights as the
-    primary ``state_dict`` (recoverable directly via
-    ``LightningModule.load_from_checkpoint``).  The wrapped optimizer's
-    ``state_dict[EMA]`` entries continue to hold what is now the live copy,
-    so resuming training is unaffected.
-
-    Behavior is automatic:
-    * If an ``EMA`` callback is attached AND ``validate_original_weights=False``,
-      the swap happens.
-    * Otherwise this behaves exactly like ``ModelCheckpoint``.
-
-    Use this in place of ``ModelCheckpoint`` for any checkpoint whose purpose
-    is to be loaded later for evaluation / inference (e.g. monitored
-    best-metric checkpoints, last.ckpt destined for inference).  For
-    train-resume-only checkpoints, plain ``ModelCheckpoint`` is fine because
-    the EMA state lives in the optimizer.
+    Optimizer moments describe the live parameters. A full checkpoint must keep
+    those live parameters in state_dict and the averages in optimizer state.
     """
 
     def _save_checkpoint(self, trainer: pl.Trainer, filepath: str) -> None:
         ema_callback = _find_ema_callback(trainer)
         if (
-            ema_callback is not None
+            self.save_weights_only
+            and ema_callback is not None
             and not ema_callback.validate_original_weights
             and ema_callback._ema_initialized(trainer)
         ):

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ModelTraining"
-version = "0.0.1"
+version = "0.0.2"
 description = "Reusable model training schedules and PyTorch Lightning helpers"
 readme = "README.md"
 requires-python = ">=3.12"
@@ -18,6 +18,10 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["build", "pytest"]
+
+[tool.setuptools]
+# Expose the source root through a path-based editable install for editors.
+package-dir = {"" = "."}
 
 [tool.setuptools.packages.find]
 where = ["."]

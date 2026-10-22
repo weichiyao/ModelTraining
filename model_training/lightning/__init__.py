@@ -1,7 +1,7 @@
 """Reusable PyTorch Lightning modules, callbacks, and training helpers."""
 
 from .callbacks import EMA, EMAModelCheckpoint, EMAOptimizer
-from .checkpoint import fit_trusted_checkpoint
+from .checkpoint import fit_trusted_checkpoint, load_training_checkpoint, load_training_weights
 from .module import TrainPLModule
 from .trainer import get_trainer_inputs
 from .wandb import wandb_logger
@@ -12,6 +12,8 @@ __all__ = [
     "EMAOptimizer",
     "TrainPLModule",
     "fit_trusted_checkpoint",
+    "load_training_checkpoint",
+    "load_training_weights",
     "get_trainer_inputs",
     "wandb_logger",
 ]

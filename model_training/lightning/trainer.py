@@ -15,11 +15,11 @@ def get_trainer_inputs(
     filename: list | None = None,
 ):
     if monitor is None:
-        monitor = ["val_loss"]
+        monitor = ['val_loss']
     if mode is None:
-        mode = ["min"]
+        mode = ['min']
     if filename is None:
-        filename = ["best-epoch{epoch}-step{step}-val_loss{val_loss}"]
+        filename = ['best-epoch{epoch}-step{step}-val_loss{val_loss:.4f}']
     if isinstance(monitor, str):
         monitor = [monitor]
     if isinstance(mode, str):
@@ -27,46 +27,46 @@ def get_trainer_inputs(
     if isinstance(filename, str):
         filename = [filename]
 
-    step_limited_training = (
-        hasattr(args, "max_steps") and args.max_steps > 0 and args.max_epochs < 0
-    )
+    step_limited_training = hasattr(args, "max_steps") and args.max_steps > 0 and args.max_epochs < 0
 
     save_on_train_epoch_end = True
-    every_n_epochs = max(1, args.log_interval)  # checkpoint/validate every N epochs
-    check_val_every_n_epoch = max(1, args.log_interval)  # validate every N epochs
-    every_n_train_steps = None  # don't checkpoint by steps
-    val_check_interval = None  # not used in epoch mode
+    every_n_epochs          = max(1, args.log_interval)  # checkpoint/validate every N epochs
+    check_val_every_n_epoch = max(1, args.log_interval)
+    val_check_interval      = None
+
+    last_every_n_epochs = every_n_epochs
+    last_every_n_train_steps = None
+    last_save_on_train_epoch_end = save_on_train_epoch_end
+    monitor_every_n_epochs = every_n_epochs
+    monitor_every_n_train_steps = None
+    monitor_save_on_train_epoch_end = False
 
     if step_limited_training:
         last_every_n_epochs = None
         last_save_on_train_epoch_end = False
         last_every_n_train_steps = max(500, int(args.log_every_n_steps))
 
-    checkpoint_every_n_train_steps = max(
-        0, int(getattr(args, "checkpoint_every_n_train_steps", 0))
-    )
-    if checkpoint_every_n_train_steps:
-        last_every_n_epochs = None
-        last_every_n_train_steps = checkpoint_every_n_train_steps
-        last_save_on_train_epoch_end = False
-    else:
-        last_every_n_epochs = every_n_epochs
-        last_every_n_train_steps = every_n_train_steps
-        last_save_on_train_epoch_end = save_on_train_epoch_end
 
+    # ---- callbacks (fast & predictable) ----
     callbacks: list[Callback] = []
 
     MonitorCheckpointCls = ModelCheckpoint
-    if hasattr(args, "ema") and args.ema:
+    if hasattr(args, "ema") and args.ema: 
         callbacks = [
-            EMA(
-                decay=0.9999,
-                validate_original_weights=False,
-                every_n_steps=1,
-                cpu_offload=False,
-            ),
+            EMA(decay=0.9999, validate_original_weights=False, every_n_steps=1, cpu_offload=False),
         ]
         MonitorCheckpointCls = EMAModelCheckpoint
+
+    step_val_interval = getattr(args, "step_val_interval", -1)
+    if step_limited_training and step_val_interval > 0:
+        from .callbacks.validation import OptimizerStepValidation
+
+        callbacks.append(OptimizerStepValidation(step_val_interval))
+        check_val_every_n_epoch = None
+        val_check_interval = 1
+        # Each completed validation supplies fresh metrics, regardless of epoch.
+        monitor_every_n_epochs = 1
+
 
     callbacks.append(
         ModelCheckpoint(
@@ -87,7 +87,10 @@ def get_trainer_inputs(
     n_monitor = len(monitor)
     for j in range(n_monitor):
         callbacks.append(
-            # Save the weights used to compute the monitored metric.
+            # Use the EMA-aware subclass when EMA is enabled so monitored
+            # checkpoints contain the EMA weights (which are what produced
+            # the val metric being monitored).  Falls back to plain
+            # ModelCheckpoint when EMA is off.
             MonitorCheckpointCls(
                 monitor=monitor[j],
                 dirpath=log_dir,
@@ -97,9 +100,11 @@ def get_trainer_inputs(
                 mode=mode[j],
                 filename=filename[j],
                 auto_insert_metric_name=False,
-                every_n_epochs=every_n_epochs,
-                every_n_train_steps=every_n_train_steps,
-                save_on_train_epoch_end=save_on_train_epoch_end,
+                every_n_epochs=monitor_every_n_epochs,
+                every_n_train_steps=monitor_every_n_train_steps,
+                # Validation metrics are not available until the validation loop finishes,
+                # so save monitored checkpoints after validation, not at train epoch end.
+                save_on_train_epoch_end=monitor_save_on_train_epoch_end,
             )
         )
 
