@@ -85,7 +85,7 @@ def coerce_wandb_run_id(run_id):
     return run_id or None
 
 
-def wandb_logger(
+def get_wandb_logger(
     wandb_usr: str,
     wandb_dir: str,
     wandb_expname: str,
