@@ -3,9 +3,8 @@
 import inspect
 
 import fsspec
+import lightning.pytorch as pl
 import torch
-
-import lightning.pytorch  as pl
 
 
 def load_training_checkpoint(path, map_location="cpu", *, weights_only=False):

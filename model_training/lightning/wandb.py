@@ -5,8 +5,8 @@ from argparse import Namespace
 import wandb
 from lightning.pytorch.loggers import WandbLogger
 
-from model_training.lightning.utils import is_rank_zero_process
 from model_training.args_helper import persist_args_pickle
+from model_training.lightning.utils import is_rank_zero_process
 
 _WANDB_RUN_DIR_RE = re.compile(r"^(?:offline-)?run-[^-]+-([A-Za-z0-9]+)$")
 
