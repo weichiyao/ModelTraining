@@ -5,6 +5,8 @@ import inspect
 import fsspec
 import torch
 
+import lightning.pytorch  as pl
+
 
 def load_training_checkpoint(path, map_location="cpu", *, weights_only=False):
     """Load a checkpoint with standard PyTorch serialization."""
@@ -12,7 +14,7 @@ def load_training_checkpoint(path, map_location="cpu", *, weights_only=False):
         return torch.load(stream, map_location=map_location, weights_only=weights_only)
 
 
-def load_training_weights(module, path):
+def load_training_weights(module:pl.LightningModule, path):
     """Restore a constructed Lightning module with its existing model and config."""
     checkpoint = load_training_checkpoint(path)
     module.on_load_checkpoint(checkpoint)
@@ -20,7 +22,7 @@ def load_training_weights(module, path):
     return module
 
 
-def fit_trusted_checkpoint(trainer, lightning_module, dm, ckpt_path=None):
+def fit_trusted_checkpoint(trainer:pl.Trainer, lightning_module:pl.LightningModule, dm:pl.LightningDataModule, ckpt_path=None):
     """Fit, optionally restoring a full checkpoint from a trusted training run."""
     if ckpt_path is None:
         trainer.fit(lightning_module, datamodule=dm)
